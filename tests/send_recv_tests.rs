@@ -1,77 +1,30 @@
 mod setup;
 
-use std::error::Error;
 use std::io::prelude::*;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use byteorder::{ByteOrder, LittleEndian};
-use etherparse::{
-    InternetSlice, PacketBuilder, PacketBuilderStep, SlicedPacket, TransportSlice, UdpHeader,
-};
+use etherparse::{InternetSlice, PacketBuilder, SlicedPacket, TransportSlice};
 
 use afpacket::sync::RawPacketStream;
 use rscan::{ScanConfig, Scanner, Target};
 
-fn generate_pkt(
-    mut pkt: &mut [u8],
-    payload: &mut [u8],
-    pkt_builder: PacketBuilderStep<UdpHeader>,
-) -> usize {
-    let len = pkt_builder.size(payload.len());
-    pkt_builder
-        .write(&mut pkt, payload)
-        .expect("failed to build packet");
-    len
-}
-
 const SRC_IP: [u8; 4] = [192, 168, 69, 1];
 const DST_IP: [u8; 4] = [192, 168, 69, 2];
 
-const SRC_PORT: u16 = 1234;
-const DST_PORT: u16 = 4321;
-
 const MAX_PACKET_SIZE: usize = 1500;
 
-#[derive(Debug, Clone)]
-struct Filter {
-    src_ip: [u8; 4],
-    dest_ip: [u8; 4],
-}
-
-fn filter_pkt(parsed_pkt: &SlicedPacket, filter: &Filter) -> bool {
-    let mut ip_match = false;
-    let mut transport_match = false;
-    if let Some(ref ip) = parsed_pkt.ip {
-        if let InternetSlice::Ipv4(ipv4) = ip {
-            ip_match = (ipv4.source() == filter.src_ip) && (ipv4.destination() == filter.dest_ip);
-        }
-    }
-
-    ip_match
-}
-
-fn synacker(mut ps: RawPacketStream, filter: Filter) {
+fn synacker(mut ps: RawPacketStream) {
     let mut rx_pkt = [0; MAX_PACKET_SIZE];
     let mut tx_pkt = [0; MAX_PACKET_SIZE];
     loop {
         let len = ps.read(&mut rx_pkt).expect("failed to read pkt");
         match SlicedPacket::from_ethernet(&rx_pkt[..len]) {
             Ok(sliced) => {
-                if filter_pkt(&sliced, &filter) {
-                    log::info!(
-                    "synacker received packet matching filter: link: {:?}, ip: {:?}, transport: {:?}",
-                    sliced.link,
-                    sliced.ip,
-                    sliced.transport
-                );
-                    if let Some(len) = generate_synack(&sliced, &mut tx_pkt) {
-                        log::info!("sending synack",);
-                        ps.write_all(&tx_pkt[..len]).expect("failed to write pkt");
-                    }
+                if let Some(len) = generate_synack(&sliced, &mut tx_pkt) {
+                    log::info!("sending synack",);
+                    ps.write_all(&tx_pkt[..len]).expect("failed to write pkt");
                 }
             }
             Err(e) => log::error!("Err {:?}", e),
@@ -119,7 +72,7 @@ fn generate_synack(rx_sliced: &SlicedPacket, mut tx_pkt: &mut [u8]) -> Option<us
 
 #[test]
 fn send_recv_test() {
-    fn test_fn(mut dev1_ps: RawPacketStream, mut dev2_ps: RawPacketStream) {
+    fn test_fn(dev1_ps: RawPacketStream, dev2_ps: RawPacketStream) {
         let scan_config = ScanConfig {
             src_mac: [0, 0, 0, 0, 0, 0],
             dst_mac: [0, 0, 0, 0, 0, 0],
@@ -128,18 +81,15 @@ fn send_recv_test() {
             src_port: 10000,
         };
 
-        let scanner = Scanner::new(dev1_ps, scan_config);
-
-        let filter = Filter {
-            src_ip: SRC_IP,
-            dest_ip: DST_IP,
-        };
-
-        let synacker_handle = thread::spawn(move || {
-            synacker(dev2_ps, filter);
+        let _synacker_handle = thread::spawn(move || {
+            synacker(dev2_ps);
         });
 
-        let max_port = 1000;
+        thread::sleep(Duration::from_secs(1));
+
+        let scanner = Scanner::new(dev1_ps, scan_config);
+
+        let max_port = 100;
         //let max_port = 2;
         let targets: Vec<Target> = (1..max_port)
             .into_iter()
@@ -157,12 +107,14 @@ fn send_recv_test() {
         }
 
         let mut responders = vec![];
-        while responders.len() < targets.len() {
-            match scanner.result_receiver.recv() {
+
+        let rx_timeout = Duration::from_secs(5);
+        let start = Instant::now();
+        while responders.len() < targets.len() && start.elapsed() < rx_timeout {
+            match scanner.result_receiver.try_recv() {
                 Ok(responder) => responders.push(responder),
-                Err(e) => {
-                    log::error!("Err {:?}", e);
-                    break;
+                Err(_e) => {
+                    //log::error!("Err {:?}", e);
                 }
             }
         }

@@ -97,8 +97,8 @@ impl Scanner {
             start_tx(tx, tx_conf, target_receiver, tx_shutdown_receiver);
         });
 
-        let rx_shutdown_receiver = shutdown_receiver.clone();
-        let rx_conf = conf.clone();
+        let rx_shutdown_receiver = shutdown_receiver;
+        let rx_conf = conf;
         let rx_handle = spawn(move || {
             start_rx(rx, rx_conf, result_sender, rx_shutdown_receiver);
         });
@@ -139,7 +139,7 @@ fn start_tx(
 
 fn start_rx(
     mut rx: RawPacketStream,
-    conf: ScanConfig,
+    _conf: ScanConfig,
     results: Sender<Target>,
     shutdown: Receiver<()>,
 ) {
