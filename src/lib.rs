@@ -159,15 +159,11 @@ fn start_rx(
 
 fn parse(pkt: &[u8]) -> Option<Target> {
     match SlicedPacket::from_ethernet(&pkt) {
-        Err(value) => {
-            println!("Err {:?}", value);
+        Err(e) => {
+            log::error!("Error parsing packet {:?}", e);
             None
         }
         Ok(value) => {
-            println!("link: {:?}", value.link);
-            println!("ip: {:?}", value.ip);
-            println!("transport: {:?}", value.transport);
-
             let ip = value.ip?;
             let transport = value.transport?;
             match transport {
@@ -180,8 +176,9 @@ fn parse(pkt: &[u8]) -> Option<Target> {
                         };
 
                         let port = tcp.source_port();
-
-                        Some(Target { ip, port })
+                        let responder = Target { ip, port };
+                        log::info!("responder: {:?}", responder);
+                        Some(responder)
                     } else {
                         None
                     }

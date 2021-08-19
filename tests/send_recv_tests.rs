@@ -62,12 +62,19 @@ fn synacker(mut ps: RawPacketStream, filter: Filter) {
         match SlicedPacket::from_ethernet(&rx_pkt[..len]) {
             Ok(sliced) => {
                 if filter_pkt(&sliced, &filter) {
+                    log::info!(
+                    "synacker received packet matching filter: link: {:?}, ip: {:?}, transport: {:?}",
+                    sliced.link,
+                    sliced.ip,
+                    sliced.transport
+                );
                     if let Some(len) = generate_synack(&sliced, &mut tx_pkt) {
+                        log::info!("sending synack",);
                         ps.write_all(&tx_pkt[..len]).expect("failed to write pkt");
                     }
                 }
             }
-            Err(e) => println!("Err {:?}", e),
+            Err(e) => log::error!("Err {:?}", e),
         }
     }
 }
@@ -132,8 +139,8 @@ fn send_recv_test() {
             synacker(dev2_ps, filter);
         });
 
-        //let max_port = 65_536;
-        let max_port = 2;
+        let max_port = 1000;
+        //let max_port = 2;
         let targets: Vec<Target> = (1..max_port)
             .into_iter()
             .map(|port| Target {
@@ -142,14 +149,27 @@ fn send_recv_test() {
             })
             .collect();
 
-        for target in targets {
+        for target in targets.iter() {
             scanner
                 .target_sender
-                .send(target)
+                .send(target.clone())
                 .expect("failed to send target");
         }
 
-        thread::sleep(Duration::from_secs(30));
+        let mut responders = vec![];
+        while responders.len() < targets.len() {
+            match scanner.result_receiver.recv() {
+                Ok(responder) => responders.push(responder),
+                Err(e) => {
+                    log::error!("Err {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        log::info!("num targets    = {}", targets.len());
+        log::info!("num responders = {}", responders.len());
+        assert_eq!(targets.len(), responders.len());
     }
 
     setup::run_test(test_fn);
