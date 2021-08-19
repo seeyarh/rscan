@@ -1,22 +1,25 @@
-use crossbeam_channel::unbounded;
-use etherparse::{
-    InternetSlice, PacketBuilder, PacketBuilderStep, SlicedPacket, TransportSlice, UdpHeader,
-};
+use afpacket::sync::RawPacketStream;
+use crossbeam_channel::{select, unbounded, Receiver, Sender};
+use etherparse::{InternetSlice, PacketBuilder, SlicedPacket, TransportSlice};
 use std::error::Error;
 use std::fmt;
+use std::io::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::thread::{spawn, JoinHandle};
 
-struct Target {
-    ip: IpAddr,
-    port: u16,
+#[derive(Clone, Debug)]
+pub struct Target {
+    pub ip: IpAddr,
+    pub port: u16,
 }
 
-struct ScanConfig {
-    src_mac: [u8; 6],
-    dst_mac: [u8; 6],
-    src_ipv4: Option<Ipv4Addr>,
-    src_ipv6: Option<Ipv6Addr>,
-    src_port: u16,
+#[derive(Clone, Debug)]
+pub struct ScanConfig {
+    pub src_mac: [u8; 6],
+    pub dst_mac: [u8; 6],
+    pub src_ipv4: Option<Ipv4Addr>,
+    pub src_ipv6: Option<Ipv6Addr>,
+    pub src_port: u16,
 }
 
 #[derive(Debug)]
@@ -69,8 +72,121 @@ impl Target {
         Ok(len)
     }
 }
-struct Scanner {}
 
-struct Sender {}
+#[derive(Debug)]
+pub struct Scanner {
+    pub target_sender: Sender<Target>,
+    pub result_receiver: Receiver<Target>,
+    pub shutdown_sender: Sender<()>,
+    pub tx_handle: JoinHandle<()>,
+    pub rx_handle: JoinHandle<()>,
+}
 
-struct Receiver {}
+impl Scanner {
+    pub fn new(packet_stream: RawPacketStream, conf: ScanConfig) -> Self {
+        let tx = packet_stream;
+        let rx = tx.clone();
+
+        let (target_sender, target_receiver) = unbounded();
+        let (result_sender, result_receiver) = unbounded();
+        let (shutdown_sender, shutdown_receiver) = unbounded();
+
+        let tx_shutdown_receiver = shutdown_receiver.clone();
+        let tx_conf = conf.clone();
+        let tx_handle = spawn(move || {
+            start_tx(tx, tx_conf, target_receiver, tx_shutdown_receiver);
+        });
+
+        let rx_shutdown_receiver = shutdown_receiver.clone();
+        let rx_conf = conf.clone();
+        let rx_handle = spawn(move || {
+            start_rx(rx, rx_conf, result_sender, rx_shutdown_receiver);
+        });
+
+        Scanner {
+            target_sender,
+            result_receiver,
+            shutdown_sender,
+            tx_handle,
+            rx_handle,
+        }
+    }
+}
+
+const MAX_PACKET_SIZE: usize = 1500;
+
+fn start_tx(
+    mut tx: RawPacketStream,
+    conf: ScanConfig,
+    targets: Receiver<Target>,
+    shutdown: Receiver<()>,
+) {
+    let mut pkt = [0; MAX_PACKET_SIZE];
+
+    loop {
+        select! {
+            recv(targets) -> target => {
+                log::info!("scanning {:?}", target);
+                let target = target.expect("failed to recv target");
+                let len = target.to_pkt(&mut pkt, &conf).expect("failed to create packet");
+                tx.write_all(&pkt[..len]).expect("failed to write packet");
+
+            }
+            recv(shutdown) -> _ => break,
+        }
+    }
+}
+
+fn start_rx(
+    mut rx: RawPacketStream,
+    conf: ScanConfig,
+    results: Sender<Target>,
+    shutdown: Receiver<()>,
+) {
+    let mut pkt = [0; MAX_PACKET_SIZE];
+
+    loop {
+        let len = rx.read(&mut pkt).expect("failed to read pkt");
+        if let Some(responder) = parse(&pkt[..len]) {
+            results.send(responder).expect("failed to send");
+        }
+
+        if let Ok(_) = shutdown.try_recv() {
+            break;
+        }
+    }
+}
+
+fn parse(pkt: &[u8]) -> Option<Target> {
+    match SlicedPacket::from_ethernet(&pkt) {
+        Err(value) => {
+            println!("Err {:?}", value);
+            None
+        }
+        Ok(value) => {
+            println!("link: {:?}", value.link);
+            println!("ip: {:?}", value.ip);
+            println!("transport: {:?}", value.transport);
+
+            let ip = value.ip?;
+            let transport = value.transport?;
+            match transport {
+                TransportSlice::Udp(_) => None,
+                TransportSlice::Tcp(tcp) => {
+                    if tcp.syn() && tcp.ack() {
+                        let ip = match ip {
+                            InternetSlice::Ipv4(ipv4) => IpAddr::V4(ipv4.source_addr()),
+                            InternetSlice::Ipv6(ipv6, _) => IpAddr::V6(ipv6.source_addr()),
+                        };
+
+                        let port = tcp.source_port();
+
+                        Some(Target { ip, port })
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+}

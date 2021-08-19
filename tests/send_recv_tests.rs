@@ -2,6 +2,7 @@ mod setup;
 
 use std::error::Error;
 use std::io::prelude::*;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -13,6 +14,7 @@ use etherparse::{
 };
 
 use afpacket::sync::RawPacketStream;
+use rscan::{ScanConfig, Scanner, Target};
 
 fn generate_pkt(
     mut pkt: &mut [u8],
@@ -37,25 +39,7 @@ const MAX_PACKET_SIZE: usize = 1500;
 #[derive(Debug, Clone)]
 struct Filter {
     src_ip: [u8; 4],
-    src_port: u16,
     dest_ip: [u8; 4],
-    dest_port: u16,
-}
-
-impl Filter {
-    fn new(
-        src_ip: [u8; 4],
-        src_port: u16,
-        dest_ip: [u8; 4],
-        dest_port: u16,
-    ) -> Result<Self, Box<dyn Error>> {
-        Ok(Self {
-            src_ip,
-            src_port,
-            dest_ip,
-            dest_port,
-        })
-    }
 }
 
 fn filter_pkt(parsed_pkt: &SlicedPacket, filter: &Filter) -> bool {
@@ -67,112 +51,105 @@ fn filter_pkt(parsed_pkt: &SlicedPacket, filter: &Filter) -> bool {
         }
     }
 
-    if let Some(ref transport) = parsed_pkt.transport {
-        if let TransportSlice::Udp(udp) = transport {
-            transport_match = (udp.source_port() == filter.src_port)
-                && (udp.destination_port() == filter.dest_port);
+    ip_match
+}
+
+fn synacker(mut ps: RawPacketStream, filter: Filter) {
+    let mut rx_pkt = [0; MAX_PACKET_SIZE];
+    let mut tx_pkt = [0; MAX_PACKET_SIZE];
+    loop {
+        let len = ps.read(&mut rx_pkt).expect("failed to read pkt");
+        match SlicedPacket::from_ethernet(&rx_pkt[..len]) {
+            Ok(sliced) => {
+                if filter_pkt(&sliced, &filter) {
+                    if let Some(len) = generate_synack(&sliced, &mut tx_pkt) {
+                        ps.write_all(&tx_pkt[..len]).expect("failed to write pkt");
+                    }
+                }
+            }
+            Err(e) => println!("Err {:?}", e),
         }
     }
+}
 
-    ip_match && transport_match
+fn generate_synack(rx_sliced: &SlicedPacket, mut tx_pkt: &mut [u8]) -> Option<usize> {
+    let pkt_builder = PacketBuilder::ethernet2([0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]);
+    let rx_ip = rx_sliced.ip.as_ref()?;
+
+    let pkt_builder = match rx_ip {
+        InternetSlice::Ipv4(ipv4) => {
+            let dst = ipv4.destination_addr().octets();
+            let src = ipv4.source_addr().octets();
+            pkt_builder.ipv4(dst, src, 20)
+        }
+        InternetSlice::Ipv6(ipv6, _) => {
+            let dst = ipv6.destination_addr().octets();
+            let src = ipv6.source_addr().octets();
+            pkt_builder.ipv6(dst, src, 20)
+        }
+    };
+
+    let rx_transport = rx_sliced.transport.as_ref()?;
+    let pkt_builder = match rx_transport {
+        TransportSlice::Udp(_) => return None,
+        TransportSlice::Tcp(tcp) => pkt_builder
+            .tcp(
+                tcp.destination_port(),
+                tcp.source_port(),
+                tcp.sequence_number() + 1,
+                tcp.window_size(),
+            )
+            .syn()
+            .ack(tcp.sequence_number()),
+    };
+
+    let len = pkt_builder.size(0);
+    pkt_builder
+        .write(&mut tx_pkt, &[])
+        .expect("failed to write pkt");
+    Some(len)
 }
 
 #[test]
 fn send_recv_test() {
-    fn test_fn(mut dev1: RawPacketStream, mut dev2: RawPacketStream) {
-        let pkts_to_send = 10_000 as u64;
+    fn test_fn(mut dev1_ps: RawPacketStream, mut dev2_ps: RawPacketStream) {
+        let scan_config = ScanConfig {
+            src_mac: [0, 0, 0, 0, 0, 0],
+            dst_mac: [0, 0, 0, 0, 0, 0],
+            src_ipv4: Some(Ipv4Addr::from(SRC_IP)),
+            src_ipv6: None,
+            src_port: 10000,
+        };
 
-        let filter = Filter::new(SRC_IP, SRC_PORT, DST_IP, DST_PORT).unwrap();
+        let scanner = Scanner::new(dev1_ps, scan_config);
 
-        let send_done = Arc::new(AtomicBool::new(false));
-        let send_done_rx = send_done.clone();
+        let filter = Filter {
+            src_ip: SRC_IP,
+            dest_ip: DST_IP,
+        };
 
-        let rx_timeout = Duration::from_secs(5);
-
-        eprintln!("starting receiver");
-        let recv_handle = thread::spawn(move || {
-            let mut pkt: [u8; MAX_PACKET_SIZE] = [0; MAX_PACKET_SIZE];
-            let mut matched_recvd_pkts = 0;
-            let mut recvd_nums = vec![false; pkts_to_send as usize];
-            let mut send_done_time: Option<Instant> = None;
-            let start = Instant::now();
-
-            let mut i = 0;
-            while matched_recvd_pkts != pkts_to_send {
-                i += 1;
-                if i % 65_536 == 0 {
-                    if send_done_rx.load(Ordering::Relaxed) {
-                        if let Some(send_done_time) = send_done_time {
-                            if send_done_time.elapsed() > rx_timeout {
-                                eprintln!("recv ending after timeout");
-                                break;
-                            }
-                        } else {
-                            send_done_time = Some(Instant::now());
-                        }
-                    }
-                }
-
-                let len_recvd = dev1.read(&mut pkt[..]).expect("failed to read packet");
-                if len_recvd > 0 {
-                    match SlicedPacket::from_ethernet(&pkt[..len_recvd]) {
-                        Ok(pkt) => {
-                            if filter_pkt(&pkt, &filter) {
-                                let n = LittleEndian::read_u64(&pkt.payload[..8]);
-                                recvd_nums[n as usize] = true;
-                                matched_recvd_pkts += 1;
-                            }
-                        }
-                        Err(e) => log::warn!("failed to parse packet {:?}", e),
-                    }
-                }
-            }
-
-            let duration = start.elapsed();
-            eprintln!("receive time is: {:?}", duration);
-            recvd_nums
+        let synacker_handle = thread::spawn(move || {
+            synacker(dev2_ps, filter);
         });
 
-        // give the receiver a chance to get going
-        thread::sleep(Duration::from_millis(50));
+        //let max_port = 65_536;
+        let max_port = 2;
+        let targets: Vec<Target> = (1..max_port)
+            .into_iter()
+            .map(|port| Target {
+                ip: IpAddr::V4(Ipv4Addr::from(DST_IP)),
+                port,
+            })
+            .collect();
 
-        eprintln!("starting sender");
-        let send_handle = thread::spawn(move || {
-            let mut pkt: [u8; MAX_PACKET_SIZE] = [0; MAX_PACKET_SIZE];
-            let mut payload: [u8; 8] = [0; 8];
-
-            let start = Instant::now();
-            for i in 0..pkts_to_send {
-                //thread::sleep(Duration::from_millis(1));
-                let pkt_builder = PacketBuilder::ethernet2([0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0])
-                    .ipv4(SRC_IP, DST_IP, 20)
-                    .udp(SRC_PORT, DST_PORT);
-
-                LittleEndian::write_u64(&mut payload, i);
-                let len_pkt = generate_pkt(&mut pkt[..], &mut payload[..], pkt_builder);
-
-                dev2.write(&pkt[..len_pkt]).expect("failed to send pkt");
-            }
-
-            send_done.store(true, Ordering::Relaxed);
-            let duration = start.elapsed();
-            eprintln!("send time is: {:?}", duration);
-        });
-
-        send_handle.join().expect("failed to join tx handle");
-        eprintln!("send done");
-
-        let recvd_nums = recv_handle.join().expect("failed to join recv handle");
-        eprintln!("recv done");
-
-        let mut n_missing = 0;
-        for (_i, recvd) in recvd_nums.iter().enumerate() {
-            if !recvd {
-                //log::debug!("missing {}", i);
-                n_missing += 1;
-            }
+        for target in targets {
+            scanner
+                .target_sender
+                .send(target)
+                .expect("failed to send target");
         }
-        assert_eq!(n_missing, 0);
+
+        thread::sleep(Duration::from_secs(30));
     }
 
     setup::run_test(test_fn);
