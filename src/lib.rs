@@ -6,14 +6,15 @@ use std::fmt;
 use std::io::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::thread::{spawn, JoinHandle};
+use serde::{Serialize, Deserialize};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Target {
     pub ip: IpAddr,
     pub port: u16,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanConfig {
     pub src_mac: [u8; 6],
     pub dst_mac: [u8; 6],

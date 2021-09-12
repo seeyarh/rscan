@@ -89,8 +89,7 @@ fn send_recv_test() {
 
         let scanner = Scanner::new(dev1_ps, scan_config);
 
-        let max_port = 100;
-        //let max_port = 2;
+        let max_port = 65000;
         let targets: Vec<Target> = (1..max_port)
             .into_iter()
             .map(|port| Target {
@@ -100,6 +99,7 @@ fn send_recv_test() {
             .collect();
 
         for target in targets.iter() {
+            thread::sleep(Duration::from_micros(1));
             scanner
                 .target_sender
                 .send(target.clone())
