@@ -89,6 +89,7 @@ fn main() {
         let line = line.expect("failed to read line");
         let target: Target = serde_json::from_str(&line).expect("failed to parse target");
         thread::sleep(Duration::from_micros(1));
+        log::trace!("sending target to scanner: {:?}", target);
         scanner
             .target_sender
             .send(target.clone())

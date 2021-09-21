@@ -1,12 +1,13 @@
 use afpacket::sync::RawPacketStream;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use etherparse::{InternetSlice, PacketBuilder, SlicedPacket, TransportSlice};
+use rand::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::io::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::thread::{spawn, JoinHandle};
-use serde::{Serialize, Deserialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Target {
@@ -53,7 +54,7 @@ impl Target {
         mut pkt: &mut [u8],
         scan_config: &ScanConfig,
     ) -> Result<usize, PacketGenError> {
-        let pkt_builder = PacketBuilder::ethernet2([0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]);
+        let pkt_builder = PacketBuilder::ethernet2(scan_config.src_mac, scan_config.dst_mac);
 
         let pkt_builder = match self.ip {
             IpAddr::V4(ipv4) => {
@@ -66,7 +67,9 @@ impl Target {
             }
         };
 
-        let pkt_builder = pkt_builder.tcp(scan_config.src_port, self.port, 0, 1).syn();
+        let pkt_builder = pkt_builder
+            .tcp(scan_config.src_port, self.port, random(), 65535)
+            .syn();
 
         let len = pkt_builder.size(0);
         pkt_builder.write(&mut pkt, &[]).unwrap();
@@ -127,7 +130,7 @@ fn start_tx(
     loop {
         select! {
             recv(targets) -> target => {
-                log::info!("scanning {:?}", target);
+                log::trace!("scanning {:?}", target);
                 let target = target.expect("failed to recv target");
                 let len = target.to_pkt(&mut pkt, &conf).expect("failed to create packet");
                 tx.write_all(&pkt[..len]).expect("failed to write packet");
@@ -165,6 +168,7 @@ fn parse(pkt: &[u8]) -> Option<Target> {
             None
         }
         Ok(value) => {
+            log::trace!("Received packet: {:?}", value);
             let ip = value.ip?;
             let transport = value.transport?;
             match transport {
@@ -178,7 +182,6 @@ fn parse(pkt: &[u8]) -> Option<Target> {
 
                         let port = tcp.source_port();
                         let responder = Target { ip, port };
-                        log::info!("responder: {:?}", responder);
                         Some(responder)
                     } else {
                         None
