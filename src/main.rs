@@ -1,41 +1,52 @@
 use afpacket::sync::RawPacketStream;
-use std::io::{self, BufReader, BufRead};
-use clap::Clap;
-use rscan::{Target, ScanConfig, Scanner};
+use clap::Parser;
+use crossbeam_channel::Receiver;
+use rscan::{ScanConfig, Scanner, Target};
 use std::error::Error;
+use std::io::{self, BufRead, BufReader};
 use std::net::IpAddr;
-use crossbeam_channel::{Receiver};
 use std::thread;
 use std::time::Duration;
 
-
 /// Rscan
-#[derive(Debug, Clone, Clap)]
-#[clap(version = "1.0", author = "Collins Huff")]
+#[derive(Debug, Clone, Parser)]
+#[command(version = "1.0", author = "Collins Huff")]
 struct Opts {
+    /// input file, if omitted defaults to stdin
+    #[arg(short, long)]
+    input: Option<String>,
+
+    /// output file, if omitted defaults to stdout
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// log file, if omitted defaults to stderr
+    #[arg(short, long)]
+    log: Option<String>,
+
     /// interface name
-    #[clap(short, long)]
+    #[arg(short, long)]
     dev: String,
 
     /// source MAC address
-    #[clap(long)]
+    #[arg(long)]
     src_mac: String,
 
     /// destination MAC address
-    #[clap(long)]
+    #[arg(long)]
     dest_mac: String,
 
     /// source IP address
-    #[clap(long)]
+    #[arg(long)]
     src_ip: String,
 
     /// source port
-    #[clap(long)]
+    #[arg(long)]
     src_port: u16,
 
-    /// A level of verbosity, and can be used multiple times
-    #[clap(short, long, parse(from_occurrences))]
-    verbose: i32,
+    /// Turn debugging information on
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 fn parse_mac(mac: &str) -> Result<[u8; 6], Box<dyn Error>> {
@@ -54,11 +65,15 @@ fn parse_mac(mac: &str) -> Result<[u8; 6], Box<dyn Error>> {
 
 fn main() {
     env_logger::init();
-    let opts: Opts = Opts::parse();
+    let opts = Opts::parse();
     let mut ps = RawPacketStream::new().unwrap();
-    ps.bind(&opts.dev).expect("failed to bind to specified interface");
+    ps.bind(&opts.dev)
+        .expect("failed to bind to specified interface");
 
-    let src_ip: IpAddr = opts.src_ip.parse().expect("failed to parse source ip address");
+    let src_ip: IpAddr = opts
+        .src_ip
+        .parse()
+        .expect("failed to parse source ip address");
     let scan_config = match src_ip {
         IpAddr::V4(src_ipv4) => ScanConfig {
             src_mac: parse_mac(&opts.src_mac).expect("failed to parse src mac"),
@@ -82,7 +97,6 @@ fn main() {
     std::thread::spawn(|| {
         print_hits(results);
     });
-
 
     let reader = BufReader::new(io::stdin());
     for line in reader.lines() {
