@@ -2,12 +2,15 @@ mod setup;
 
 use std::io::prelude::*;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use etherparse::{InternetSlice, PacketBuilder, SlicedPacket, TransportSlice};
+use etherparse::{ip_number, SlicedPacket};
 
 use afpacket::sync::RawPacketStream;
+use rscan::packet::generate_synack;
 use rscan::{ScanConfig, Scanner, Target};
 
 const SRC_IP: [u8; 4] = [192, 168, 69, 1];
@@ -15,10 +18,13 @@ const DST_IP: [u8; 4] = [192, 168, 69, 2];
 
 const MAX_PACKET_SIZE: usize = 1500;
 
-fn synacker(mut ps: RawPacketStream) {
+fn test_receiver(mut ps: RawPacketStream, shutdown: Arc<AtomicBool>) {
     let mut rx_pkt = [0; MAX_PACKET_SIZE];
     let mut tx_pkt = [0; MAX_PACKET_SIZE];
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         let len = ps.read(&mut rx_pkt).expect("failed to read pkt");
         match SlicedPacket::from_ethernet(&rx_pkt[..len]) {
             Ok(sliced) => {
@@ -32,44 +38,6 @@ fn synacker(mut ps: RawPacketStream) {
     }
 }
 
-fn generate_synack(rx_sliced: &SlicedPacket, mut tx_pkt: &mut [u8]) -> Option<usize> {
-    let pkt_builder = PacketBuilder::ethernet2([0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]);
-    let rx_ip = rx_sliced.ip.as_ref()?;
-
-    let pkt_builder = match rx_ip {
-        InternetSlice::Ipv4(ipv4) => {
-            let dst = ipv4.destination_addr().octets();
-            let src = ipv4.source_addr().octets();
-            pkt_builder.ipv4(dst, src, 20)
-        }
-        InternetSlice::Ipv6(ipv6, _) => {
-            let dst = ipv6.destination_addr().octets();
-            let src = ipv6.source_addr().octets();
-            pkt_builder.ipv6(dst, src, 20)
-        }
-    };
-
-    let rx_transport = rx_sliced.transport.as_ref()?;
-    let pkt_builder = match rx_transport {
-        TransportSlice::Udp(_) => return None,
-        TransportSlice::Tcp(tcp) => pkt_builder
-            .tcp(
-                tcp.destination_port(),
-                tcp.source_port(),
-                tcp.sequence_number() + 1,
-                tcp.window_size(),
-            )
-            .syn()
-            .ack(tcp.sequence_number()),
-    };
-
-    let len = pkt_builder.size(0);
-    pkt_builder
-        .write(&mut tx_pkt, &[])
-        .expect("failed to write pkt");
-    Some(len)
-}
-
 #[test]
 fn send_recv_test() {
     fn test_fn(dev1_ps: RawPacketStream, dev2_ps: RawPacketStream) {
@@ -79,15 +47,17 @@ fn send_recv_test() {
             src_ipv4: Some(Ipv4Addr::from(SRC_IP)),
             src_ipv6: None,
             src_port: 10000,
+            handshakes_file: "handshakes.yaml".into(),
         };
 
-        let _synacker_handle = thread::spawn(move || {
-            synacker(dev2_ps);
+        let scanner = Scanner::new(dev1_ps, scan_config);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let test_receiver_shutdown = shutdown.clone();
+        let test_receiver_handle = thread::spawn(move || {
+            test_receiver(dev2_ps, test_receiver_shutdown);
         });
 
         thread::sleep(Duration::from_secs(1));
-
-        let scanner = Scanner::new(dev1_ps, scan_config);
 
         let max_port = 65000;
         let targets: Vec<Target> = (1..max_port)
@@ -95,15 +65,14 @@ fn send_recv_test() {
             .map(|port| Target {
                 ip: IpAddr::V4(Ipv4Addr::from(DST_IP)),
                 port,
+                ip_number: u8::from(ip_number::TCP),
+                data: None,
             })
             .collect();
 
         for target in targets.iter() {
             thread::sleep(Duration::from_micros(1));
-            scanner
-                .target_sender
-                .send(target.clone())
-                .expect("failed to send target");
+            scanner.scan_target(&target);
         }
 
         let mut responders = vec![];
@@ -118,6 +87,13 @@ fn send_recv_test() {
                 }
             }
         }
+
+        scanner.shutdown();
+
+        shutdown.swap(true, Ordering::Relaxed);
+        let _ = test_receiver_handle
+            .join()
+            .expect("failed to wait for receive thread");
 
         log::info!("num targets    = {}", targets.len());
         log::info!("num responders = {}", responders.len());

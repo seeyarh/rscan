@@ -1,7 +1,7 @@
 use afpacket::sync::RawPacketStream;
 use clap::Parser;
 use crossbeam_channel::Receiver;
-use rscan::{ScanConfig, Scanner, Target};
+use rscan::{ScanConfig, ScanResult, Scanner, Target};
 use std::error::Error;
 use std::io::{self, BufRead, BufReader};
 use std::net::IpAddr;
@@ -24,6 +24,10 @@ struct Opts {
     #[arg(short, long)]
     log: Option<String>,
 
+    /// service handshakes file
+    #[arg(short, long)]
+    handshakes_file: String,
+
     /// interface name
     #[arg(short, long)]
     dev: String,
@@ -36,9 +40,13 @@ struct Opts {
     #[arg(long)]
     dest_mac: String,
 
-    /// source IP address
+    /// source IPv4 address
     #[arg(long)]
-    src_ip: String,
+    src_ipv4: Option<String>,
+
+    /// source IPv6 address
+    #[arg(long)]
+    src_ipv6: Option<String>,
 
     /// source port
     #[arg(long)]
@@ -70,25 +78,29 @@ fn main() {
     ps.bind(&opts.dev)
         .expect("failed to bind to specified interface");
 
-    let src_ip: IpAddr = opts
-        .src_ip
-        .parse()
-        .expect("failed to parse source ip address");
-    let scan_config = match src_ip {
-        IpAddr::V4(src_ipv4) => ScanConfig {
-            src_mac: parse_mac(&opts.src_mac).expect("failed to parse src mac"),
-            dst_mac: parse_mac(&opts.dest_mac).expect("failed to parse src mac"),
-            src_ipv4: Some(src_ipv4),
-            src_ipv6: None,
-            src_port: opts.src_port,
-        },
-        IpAddr::V6(src_ipv6) => ScanConfig {
-            src_mac: parse_mac(&opts.src_mac).expect("failed to parse src mac"),
-            dst_mac: parse_mac(&opts.dest_mac).expect("failed to parse src mac"),
-            src_ipv4: None,
-            src_ipv6: Some(src_ipv6),
-            src_port: opts.src_port,
-        },
+    let src_ipv4 =
+        opts.src_ipv4.map(
+            |ip| match ip.parse().expect("failed to parse source ip address") {
+                IpAddr::V4(ip) => ip,
+                _ => panic!("provided source ipv4 address is not valid"),
+            },
+        );
+
+    let src_ipv6 =
+        opts.src_ipv6.map(
+            |ip| match ip.parse().expect("failed to parse source ip address") {
+                IpAddr::V6(ip) => ip,
+                _ => panic!("provided source ipv6 address is not valid"),
+            },
+        );
+
+    let scan_config = ScanConfig {
+        src_mac: parse_mac(&opts.src_mac).expect("failed to parse src mac"),
+        dst_mac: parse_mac(&opts.dest_mac).expect("failed to parse src mac"),
+        src_ipv4,
+        src_ipv6,
+        src_port: opts.src_port,
+        handshakes_file: opts.handshakes_file,
     };
 
     let scanner = Scanner::new(ps, scan_config);
@@ -104,16 +116,15 @@ fn main() {
         let target: Target = serde_json::from_str(&line).expect("failed to parse target");
         thread::sleep(Duration::from_micros(1));
         log::trace!("sending target to scanner: {:?}", target);
-        scanner
-            .target_sender
-            .send(target.clone())
-            .expect("failed to send target");
+        scanner.scan_target(&target);
     }
 
     thread::sleep(Duration::from_secs(10));
+
+    scanner.shutdown();
 }
 
-fn print_hits(results: Receiver<Target>) {
+fn print_hits(results: Receiver<ScanResult>) {
     for result in results {
         let result = serde_json::to_string(&result).expect("failed to serialize result");
         println!("{}", result);
