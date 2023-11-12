@@ -8,7 +8,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{spawn, JoinHandle};
+use std::thread::{self, JoinHandle};
 
 pub mod handshake;
 pub mod packet;
@@ -25,7 +25,7 @@ pub struct Target {
     pub data: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub enum TcpFlags {
     Syn,
     Synack,
@@ -126,9 +126,12 @@ impl Scanner {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let tx_shutdown = shutdown.clone();
-        let tx_handle = spawn(move || {
-            send::start_tx(tx, target_receiver, tx_shutdown);
-        });
+        let tx_handle = thread::Builder::new()
+            .name("tx".into())
+            .spawn(move || {
+                send::start_tx(tx, target_receiver, tx_shutdown);
+            })
+            .expect("failed to start tx thread");
 
         let handshakes = handshake::get_service_handshakes(&conf.handshakes_file)
             .expect("failed to get handshakes from file");
@@ -136,16 +139,19 @@ impl Scanner {
         let rx_target_sender = target_sender.clone();
         let rx_shutdown = shutdown.clone();
         let rx_conf = conf.clone();
-        let rx_handle = spawn(move || {
-            recv::start_rx(
-                rx,
-                rx_conf,
-                handshakes,
-                rx_target_sender,
-                result_sender,
-                rx_shutdown,
-            );
-        });
+        let rx_handle = thread::Builder::new()
+            .name("rx".into())
+            .spawn(move || {
+                recv::start_rx(
+                    rx,
+                    rx_conf,
+                    handshakes,
+                    rx_target_sender,
+                    result_sender,
+                    rx_shutdown,
+                );
+            })
+            .expect("failed to start rx thread");
 
         Scanner {
             conf,
