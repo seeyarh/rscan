@@ -27,7 +27,7 @@ struct State {
 
 pub fn start_rx(
     mut rx: RawPacketStream,
-    _conf: ScanConfig,
+    conf: ScanConfig,
     handshakes: Vec<Handshake>,
     response_sender: Sender<Vec<u8>>,
     results_sender: Sender<ScanResult>,
@@ -42,16 +42,17 @@ pub fn start_rx(
             break;
         }
         let len = rx.read(&mut recv_pkt).expect("failed to read pkt");
-        if let Some((result, send_response)) = handle_packet(
+        if let Some((result, resp_len)) = handle_packet(
+            &conf,
             &recv_pkt[..len],
             &mut resp_pkt,
             &handshakes,
             &mut host_state,
         ) {
             results_sender.send(result).expect("failed to send result");
-            if send_response {
+            if resp_len > 0 {
                 response_sender
-                    .send(resp_pkt.into())
+                    .send(resp_pkt[..resp_len].into())
                     .expect("failed to send response packet");
             }
         }
@@ -59,19 +60,19 @@ pub fn start_rx(
 }
 
 fn handle_packet(
+    conf: &ScanConfig,
     recvd_pkt: &[u8],
     resp_pkt: &mut [u8],
     handshakes: &[Handshake],
     host_state: &mut HashMap<Host, State>,
-) -> Option<(ScanResult, bool)> {
+) -> Option<(ScanResult, usize)> {
     match SlicedPacket::from_ethernet(&recvd_pkt) {
         Err(e) => {
-            log::error!("Error parsing packet error: {:?}", e);
-            log::error!("Error parsing packet recvd_pkt {:?}", recvd_pkt);
+            //log::error!("Error parsing packet error: {:?}", e);
+            //log::error!("Error parsing packet recvd_pkt {:?}", recvd_pkt);
             None
         }
         Ok(value) => {
-            packet::log_response(&value);
             let ip = match &value.ip.as_ref()? {
                 InternetSlice::Ipv4(slice) => IpAddr::V4(slice.header().source_addr()),
                 InternetSlice::Ipv6(slice) => IpAddr::V6(slice.header().source_addr()),
@@ -83,10 +84,15 @@ fn handle_packet(
                 | TransportSlice::Unknown(_)
                 | TransportSlice::Udp(_) => None,
                 TransportSlice::Tcp(tcp) => {
+                    if tcp.destination_port() != conf.src_port {
+                        return None;
+                    }
+                    packet::log_response(&value);
                     let host = Host {
                         ip,
                         port: tcp.source_port(),
                     };
+                    let mut resp_len = 0;
                     if tcp.syn() && tcp.ack() {
                         let scan_result = ScanResult {
                             ip,
@@ -94,7 +100,7 @@ fn handle_packet(
                             transport_protocol: u8::from(ip_number::TCP),
                             service: None,
                             tcp_flags: Some(TcpFlags::Synack),
-                            data: None,
+                            data: vec![],
                         };
 
                         // have we tried to scan this host previously?
@@ -114,10 +120,12 @@ fn handle_packet(
                                     tcp_flags: TcpFlags::Synack,
                                 };
                                 host_state.insert(host, state);
-                                build_tcp_response(&value, &next_handshake.request, resp_pkt);
+                                resp_len =
+                                    build_tcp_response(&value, &next_handshake.request, resp_pkt)
+                                        .expect("failed to build tcp response");
                             }
                         }
-                        Some((scan_result, true))
+                        Some((scan_result, resp_len))
                     } else if tcp.ack() {
                         log::info!("recv ack");
 
@@ -127,7 +135,7 @@ fn handle_packet(
                             transport_protocol: u8::from(ip_number::TCP),
                             service: None,
                             tcp_flags: Some(TcpFlags::Ack),
-                            data: Some(value.payload.into()),
+                            data: value.payload.into(),
                         };
                         // check handshake responses to see if any match
                         let payload = value.payload;
@@ -141,7 +149,7 @@ fn handle_packet(
                             }
                         }
 
-                        Some((scan_result, false))
+                        Some((scan_result, resp_len))
                     } else if tcp.rst() {
                         let scan_result = ScanResult {
                             ip,
@@ -149,7 +157,7 @@ fn handle_packet(
                             transport_protocol: u8::from(ip_number::TCP),
                             service: None,
                             tcp_flags: Some(TcpFlags::Rst),
-                            data: None,
+                            data: vec![],
                         };
                         // have we tried to scan this host previously, and received a synack at some point?
                         match host_state.get_mut(&host) {
@@ -160,7 +168,7 @@ fn handle_packet(
                             // if not, don't try to scan
                             None => {}
                         }
-                        Some((scan_result, false))
+                        Some((scan_result, resp_len))
                     } else {
                         None
                     }

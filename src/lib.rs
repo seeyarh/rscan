@@ -3,6 +3,8 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use etherparse::PacketBuilder;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
+use serde_with::base64::Base64;
+use serde_with::serde_as;
 use std::error::Error;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -33,6 +35,7 @@ pub enum TcpFlags {
     Rst,
 }
 
+#[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanResult {
     pub ip: IpAddr,
@@ -40,7 +43,8 @@ pub struct ScanResult {
     pub transport_protocol: u8,
     pub service: Option<String>,
     pub tcp_flags: Option<TcpFlags>,
-    pub data: Option<Vec<u8>>,
+    #[serde_as(as = "Base64")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -44,12 +44,12 @@ pub fn build_response_tcp_header(
             let builder = builder.tcp(
                 tcp.destination_port(),
                 tcp.source_port(),
-                tcp.sequence_number() + 1,
+                tcp.acknowledgment_number(),
                 tcp.window_size(),
             );
 
             if tcp.syn() && tcp.ack() {
-                return Some((builder.ack(tcp.sequence_number()), true));
+                return Some((builder.ack(tcp.sequence_number() + 1), true));
             } else if tcp.syn() {
                 return Some((builder.syn().ack(tcp.sequence_number()), false));
             } else if tcp.ack() {
