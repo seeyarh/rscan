@@ -1,11 +1,10 @@
-use super::handshake::Handshake;
 use super::packet;
 use crate::packet::build_tcp_response;
 use crate::{ScanConfig, ScanResult, TcpFlags, MAX_PACKET_SIZE};
-use afpacket::sync::RawPacketStream;
 use crossbeam_channel::Sender;
 use etherparse::{ip_number, InternetSlice, SlicedPacket, TransportSlice};
 use memchr::memmem;
+use pcap::{Active, Capture};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::prelude::*;
@@ -21,14 +20,12 @@ struct Host {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Hash)]
 struct State {
-    handshakes_attempted: usize,
     tcp_flags: TcpFlags,
 }
 
 pub fn start_rx(
-    mut rx: RawPacketStream,
+    mut rx: Capture<Active>,
     conf: ScanConfig,
-    handshakes: Vec<Handshake>,
     response_sender: Sender<Vec<u8>>,
     results_sender: Sender<ScanResult>,
     shutdown: Arc<AtomicBool>,
@@ -41,14 +38,9 @@ pub fn start_rx(
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        let len = rx.read(&mut recv_pkt).expect("failed to read pkt");
-        if let Some((result, resp_len)) = handle_packet(
-            &conf,
-            &recv_pkt[..len],
-            &mut resp_pkt,
-            &handshakes,
-            &mut host_state,
-        ) {
+        let pkt = rx.next_packet().expect("failed to read pkt");
+        if let Some((result, resp_len)) = handle_packet(&conf, &pkt, &mut resp_pkt, &mut host_state)
+        {
             results_sender.send(result).expect("failed to send result");
             if resp_len > 0 {
                 response_sender
@@ -63,7 +55,6 @@ fn handle_packet(
     conf: &ScanConfig,
     recvd_pkt: &[u8],
     resp_pkt: &mut [u8],
-    handshakes: &[Handshake],
     host_state: &mut HashMap<Host, State>,
 ) -> Option<(ScanResult, usize)> {
     match SlicedPacket::from_ethernet(&recvd_pkt) {
@@ -105,24 +96,17 @@ fn handle_packet(
 
                         // have we tried to scan this host previously?
                         match host_state.get_mut(&host) {
-                            // if so, try next handshake,
                             Some(state) => {
                                 // this shouldn't be oob, check if we're out of hs in the ack section
-                                let _next_handshake = &handshakes[state.handshakes_attempted];
-                                state.handshakes_attempted += 1;
                                 state.tcp_flags = TcpFlags::Synack;
                             }
-                            // if not, try first handshake
                             None => {
-                                let next_handshake = &handshakes[0];
                                 let state = State {
-                                    handshakes_attempted: 1,
                                     tcp_flags: TcpFlags::Synack,
                                 };
                                 host_state.insert(host, state);
-                                resp_len =
-                                    build_tcp_response(&value, &next_handshake.request, resp_pkt)
-                                        .expect("failed to build tcp response");
+                                resp_len = build_tcp_response(&value, &[], resp_pkt)
+                                    .expect("failed to build tcp response");
                             }
                         }
                         Some((scan_result, resp_len))
@@ -137,17 +121,7 @@ fn handle_packet(
                             tcp_flags: Some(TcpFlags::Ack),
                             data: value.payload.into(),
                         };
-                        // check handshake responses to see if any match
                         let payload = value.payload;
-                        for h in handshakes {
-                            log::info!("checking service {}", &h.service);
-                            log::info!("checking {:x?} is in {:x?}", &h.response, payload);
-                            if memmem::find(payload, &h.response).is_some() {
-                                log::info!("match for service {}", &h.service);
-                                scan_result.service = Some(h.service.clone());
-                                break;
-                            }
-                        }
 
                         Some((scan_result, resp_len))
                     } else if tcp.rst() {
@@ -161,7 +135,6 @@ fn handle_packet(
                         };
                         // have we tried to scan this host previously, and received a synack at some point?
                         match host_state.get_mut(&host) {
-                            // if so, re-enqueue for syn scan and try next handshake,
                             Some(_state) => {
                                 //
                             }

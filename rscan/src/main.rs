@@ -1,6 +1,6 @@
-use afpacket::sync::RawPacketStream;
 use clap::Parser;
 use crossbeam_channel::Receiver;
+use pcap::Device;
 use rscan::{ScanConfig, ScanResult, Scanner, Target};
 use std::error::Error;
 use std::io::{self, BufRead, BufReader};
@@ -100,7 +100,6 @@ fn main() {
         src_ipv4,
         src_ipv6,
         src_port: opts.src_port,
-        handshakes_file: opts.handshakes_file,
     };
 
     let scanner = Scanner::new(ps, scan_config);

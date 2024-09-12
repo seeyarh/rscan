@@ -1,6 +1,6 @@
-use afpacket::sync::RawPacketStream;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use etherparse::PacketBuilder;
+use pcap::Device;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-pub mod handshake;
 pub mod packet;
 pub mod recv;
 pub mod send;
@@ -54,7 +53,6 @@ pub struct ScanConfig {
     pub src_ipv4: Option<Ipv4Addr>,
     pub src_ipv6: Option<Ipv6Addr>,
     pub src_port: u16,
-    pub handshakes_file: String,
 }
 
 #[derive(Debug)]
@@ -137,23 +135,13 @@ impl Scanner {
             })
             .expect("failed to start tx thread");
 
-        let handshakes = handshake::get_service_handshakes(&conf.handshakes_file)
-            .expect("failed to get handshakes from file");
-
         let rx_target_sender = target_sender.clone();
         let rx_shutdown = shutdown.clone();
         let rx_conf = conf.clone();
         let rx_handle = thread::Builder::new()
             .name("rx".into())
             .spawn(move || {
-                recv::start_rx(
-                    rx,
-                    rx_conf,
-                    handshakes,
-                    rx_target_sender,
-                    result_sender,
-                    rx_shutdown,
-                );
+                recv::start_rx(rx, rx_conf, rx_target_sender, result_sender, rx_shutdown);
             })
             .expect("failed to start rx thread");
 
